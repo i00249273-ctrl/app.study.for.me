@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>河野玄斗の眼 - Study Tracker</title>
+    <link rel="manifest" href="manifest.json">
+    <link rel="apple-touch-icon" href="icon.png">
+    <style>
+        body { margin: 0; background: #000; color: #fff; font-family: sans-serif; overflow: hidden; touch-action: none; }
+        #app { display: flex; flex-direction: column; width: 100vw; height: 100vh; }
+        
+        /* カメラ表示エリア (view.camera 70%) */
+        #view_container { flex: 1; position: relative; overflow: hidden; }
+        #view_camera { width: 100%; height: 100%; object-fit: cover; }
+        
+        /* データ表示エリア (下部) */
+        #data_panel { height: 40vh; border-top: 2px solid #333; display: flex; background: #111; }
+        .chart-box { flex: 1; border-right: 1px solid #222; position: relative; }
+        .chart-box canvas { width: 100%; height: 100%; }
+        .chart-label { position: absolute; top: 5px; left: 5px; font-size: 10px; color: #aaa; pointer-events: none; }
+
+        #status_overlay { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.7); padding: 5px; font-size: 12px; border-radius: 4px; pointer-events: none; z-index: 10; }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <div id="view_container">
+            <canvas id="view_camera"></canvas>
+            <div id="status_overlay">
+                FPS: <span id="fps_val">0</span> | Status: <span id="study_status">Init</span><br>
+                Naka: <span id="naka_res">0x0</span> | View: <span id="view_res">0x0</span>
+            </div>
+        </div>
+        <div id="data_panel">
+            <div class="chart-box">
+                <span class="chart-label">TODAY'S FOCUS (Radar)</span>
+                <canvas id="radar_chart"></canvas>
+            </div>
+            <div class="chart-box">
+                <span class="chart-label">PAST WEEK (Line)</span>
+                <canvas id="line_chart"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <script src="localforage.min.js"></script>
+    <script src="Stats.min.js"></script>
+
+    <script type="module">
+        // インポートパスを直下（./）に修正
+        import { BinaryStorage } from './binary_storage.js';
+        import { HandTracker } from './hand_tracker.js';
+        import { GraphDrawer } from './graph_drawer.js';
+
+        const CONFIG = {
+            ANALYZE_RATIO: 0.8, // naka 80%
+            VIEW_RATIO: 0.7,    // view 70%
+            TARGET_FPS: 60,
+            GRACE_PERIOD_FRAMES: 300, // 5秒 (60fps想定)
+            ONE_WEEK_MS: 7 * 24 * 60 * 60 * 1000
+        };
+
+        const State = {
+            video: document.createElement('video'),
+            naka: { canvas: document.createElement('canvas'), ctx: null },
+            view: { canvas: document.getElementById('view_camera'), ctx: null },
+            tracker: null,
+            stats: new Stats(),
+            studyInfo: {
+                startTime: null,
+                stopCounter: 0,
+                isStudying: true,
+                dailyScores: { focus: 100, time: 0, avoidance: 100 }
+            }
+        };
+
+        const fpsVal = document.getElementById('fps_val');
+        const studyStatus = document.getElementById('study_status');
+
+        async function init() {
+            // Stats.js setup
+            State.stats.showPanel(0); 
+            document.getElementById('view_container').appendChild(State.stats.dom);
+            State.stats.dom.style.position = 'absolute';
+            State.stats.dom.style.top = '0px';
+            State.stats.dom.style.right = '0px';
+            State.stats.dom.style.left = 'auto';
+
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: "user",
+                        frameRate: { ideal: CONFIG.TARGET_FPS },
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 }
+                    }
+                });
+                State.video.srcObject = stream;
+                await State.video.play();
+
+                const settings = stream.getVideoTracks()[0].getSettings();
+                const { width: w, height: h } = settings;
+
+                // naka.camera (80%解析)
+                State.naka.canvas.width = Math.floor(w * CONFIG.ANALYZE_RATIO);
+                State.naka.canvas.height = Math.floor(h * CONFIG.ANALYZE_RATIO);
+                State.naka.ctx = State.naka.canvas.getContext('2d', { willReadFrequently: true });
+
+                // view.camera (70%表示)
+                State.view.canvas.width = Math.floor(w * CONFIG.VIEW_RATIO);
+                State.view.canvas.height = Math.floor(h * CONFIG.VIEW_RATIO);
+                State.view.ctx = State.view.canvas.getContext('2d');
+
+                document.getElementById('naka_res').innerText = `${State.naka.canvas.width}x${State.naka.canvas.height}`;
+                document.getElementById('view_res').innerText = `${State.view.canvas.width}x${State.view.canvas.height}`;
+
+                State.tracker = new HandTracker(State.naka.canvas.width, State.naka.canvas.height);
+                GraphDrawer.init();
+
+                // 過去データの読み込みと描画
+                await loadHistory();
+
+                State.studyInfo.startTime = Date.now();
+                requestAnimationFrame(mainLoop);
+
+            } catch (err) {
+                console.error("Init Failed:", err);
+                studyStatus.innerText = "Error: " + err.message;
+            }
+        }
+
+        async function loadHistory() {
+            const binaryStr = await localforage.getItem('study_binary_data');
+            if (binaryStr) {
+                try {
+                    const jsonStr = BinaryStorage.fromBinary(binaryStr);
+                    let history = JSON.parse(jsonStr);
+                    const now = Date.now();
+                    history = history.filter(item => (now - item.timestamp) < CONFIG.ONE_WEEK_MS);
+                    GraphDrawer.drawLine(history);
+                } catch (e) { console.error(e); }
+            }
+        }
+
+        function mainLoop() {
+            State.stats.begin();
+
+            // 表示
+            State.view.ctx.drawImage(State.video, 0, 0, State.view.canvas.width, State.view.canvas.height);
+
+            // 解析
+            State.naka.ctx.drawImage(State.video, 0, 0, State.naka.canvas.width, State.naka.canvas.height);
+            const currentData = State.naka.ctx.getImageData(0, 0, State.naka.canvas.width, State.naka.canvas.height);
+
+            const isMoving = State.tracker.analyze(currentData);
+            
+            if (isMoving) {
+                State.studyInfo.stopCounter = 0;
+                State.studyInfo.isStudying = true;
+                studyStatus.innerText = "STUDYING";
+                studyStatus.style.color = "#0f0";
+            } else {
+                State.studyInfo.stopCounter++;
+                studyStatus.innerText = `PAUSED (${State.studyInfo.stopCounter})`;
+                studyStatus.style.color = "#f00";
+            }
+
+            if (State.studyInfo.stopCounter > CONFIG.GRACE_PERIOD_FRAMES) {
+                triggerScold();
+                State.studyInfo.stopCounter = 0;
+            }
+
+            GraphDrawer.drawRadar(State.studyInfo.dailyScores);
+            fpsVal.innerText = Math.round(stats.dom.firstChild.innerText) || 0;
+
+            State.stats.end();
+            requestAnimationFrame(mainLoop);
+        }
+
+        function triggerScold() {
+            // アップロードされたファイル名に合わせてランダム再生
+            const sounds = ['study.or.kill.mp3', 'pls.study.mp3'];
+            const audio = new Audio(sounds[Math.floor(Math.random() * sounds.length)]);
+            audio.play().catch(e => console.warn("Audio play failed", e));
+
+            State.view.canvas.style.filter = "invert(1) sepia(1)";
+            setTimeout(() => State.view.canvas.style.filter = "none", 200);
+            
+            State.studyInfo.dailyScores.avoidance = Math.max(0, State.studyInfo.dailyScores.avoidance - 10);
+        }
+
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('sw.js');
+        }
+
+        init();
+    </script>
+</body>
+</html>
